@@ -1,0 +1,30 @@
+{
+  "name": "particlecloud",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite", "build": "tsc && vite build", "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VincentYYZ/ParticleCloud.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/VincentYYZ/ParticleCloud/issues"
+  },
+  "homepage": "https://github.com/VincentYYZ/ParticleCloud#readme",
+  "dependencies": {
+    "@types/dat.gui": "^0.7.13",
+    "@types/three": "^0.184.1",
+    "dat.gui": "^0.7.9",
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16"
+  }
+}

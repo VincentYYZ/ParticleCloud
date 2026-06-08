@@ -1,0 +1,389 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>Particle Cloud Interaction</title>
+    <style>
+      @font-face {
+        font-family: "CustomFont";
+        src: local("PingFang SC"), local("Microsoft YaHei");
+      }
+      body {
+        margin: 0;
+        overflow: hidden;
+        background-color: #000;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        color: #fff;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      canvas {
+        display: block;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-user-drag: none;
+        outline: none;
+      }
+      #ui-container {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+      /* Top Header */
+      .header {
+        position: absolute;
+        top: 40px;
+        left: 20px;
+        right: 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        pointer-events: auto;
+      }
+      .logo {
+        font-size: 16px;
+        letter-spacing: 2px;
+        font-family: "CustomFont", serif;
+        opacity: 0.8;
+      }
+      .nav-links {
+        display: flex;
+        gap: 24px;
+        font-size: 11px;
+        letter-spacing: 2px;
+        opacity: 0.6;
+      }
+      .header-icons {
+        display: flex;
+        gap: 20px;
+        opacity: 0.8;
+      }
+      /* Gemini Pill */
+      .gemini-pill-container {
+        position: absolute;
+        top: 100px;
+        width: 100%;
+        display: flex;
+        justify-content: center;
+        pointer-events: none;
+      }
+      .gemini-pill {
+        background: rgba(20, 25, 20, 0.6);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 30px;
+        padding: 8px 24px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 14px;
+        letter-spacing: 1px;
+        color: #ddd;
+        pointer-events: auto;
+        cursor: pointer;
+      }
+      .gemini-pill .dot {
+        width: 8px;
+        height: 8px;
+        background: #00ff88;
+        border-radius: 50%;
+        box-shadow: 0 0 10px #00ff88;
+      }
+      /* Settings Icon */
+      .settings-icon {
+        position: absolute;
+        top: 100px;
+        right: 20px;
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        cursor: pointer;
+        pointer-events: auto;
+        opacity: 0.8;
+      }
+      /* Bottom Controls */
+      .bottom-section {
+        position: absolute;
+        bottom: 80px;
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 30px;
+        pointer-events: none;
+      }
+      .mic-btn-container {
+        position: relative;
+        width: 80px;
+        height: 80px;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        pointer-events: auto;
+      }
+      .mic-btn {
+        width: 64px;
+        height: 64px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        cursor: pointer;
+        z-index: 2;
+        transition: all 0.3s;
+      }
+      .mic-btn:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+      .mic-btn svg {
+        width: 20px;
+        height: 20px;
+        opacity: 0.8;
+      }
+      /* Fake sound rings around mic */
+      .mic-ring-1, .mic-ring-2 {
+        position: absolute;
+        border-radius: 50%;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+      }
+      .mic-ring-1 {
+        width: 90px;
+        height: 90px;
+        animation: pulse 2s infinite;
+      }
+      .mic-ring-2 {
+        width: 110px;
+        height: 110px;
+        animation: pulse 2s infinite 1s;
+      }
+      @keyframes pulse {
+        0% { transform: translate(-50%, -50%) scale(0.8); opacity: 0; }
+        50% { opacity: 1; }
+        100% { transform: translate(-50%, -50%) scale(1.5); opacity: 0; }
+      }
+      
+      .action-row {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        pointer-events: auto;
+      }
+      .timer {
+        font-family: monospace;
+        font-size: 11px;
+        background: rgba(255, 255, 255, 0.1);
+        padding: 4px 10px;
+        border-radius: 12px;
+        letter-spacing: 1px;
+      }
+      .save-btn {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.5);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .save-btn:hover {
+        color: rgba(255, 255, 255, 0.8);
+      }
+      .close-btn {
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        background: rgba(255, 50, 50, 0.1);
+        border: 1px solid rgba(255, 50, 50, 0.2);
+        color: #ff5555;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      
+      .subtitle-container {
+        margin-top: 10px;
+        text-align: center;
+      }
+      .subtitle {
+        font-size: 20px;
+        font-weight: 500;
+        font-family: "CustomFont", serif;
+        margin-bottom: 8px;
+        text-shadow: 0 2px 10px rgba(0,0,0,0.8);
+      }
+      .upload-another {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.5);
+        cursor: pointer;
+        pointer-events: auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        position: relative;
+      }
+      .upload-another input[type="file"] {
+        position: absolute;
+        opacity: 0;
+        width: 100%;
+        height: 100%;
+        cursor: pointer;
+        left: 0;
+        top: 0;
+      }
+      
+      /* Customize dat.gui */
+      .dg.ac {
+        z-index: 10 !important;
+        pointer-events: auto;
+        top: 140px !important;
+        right: 20px !important;
+        display: none;
+      }
+      .dg.ac.visible {
+        display: block;
+      }
+      .dg.main {
+        background-color: rgba(10, 10, 10, 0.8) !important;
+        border-radius: 10px;
+        overflow: hidden;
+      }
+      .dg .c input[type=text] {
+        background-color: rgba(255,255,255,0.1);
+        color: #fff;
+      }
+      .dg .cr.number {
+        border-left: none;
+      }
+      .dg .cr.boolean {
+        border-left: none;
+      }
+      .dg .property-name {
+        width: 50%;
+        color: rgba(255,255,255,0.6);
+        font-size: 10px;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+      }
+      .dg .slider {
+        background-color: rgba(255,255,255,0.1);
+      }
+      .dg .slider-fg {
+        background-color: #fff;
+      }
+      
+      /* Central prompt text inside particle cloud */
+      .center-text {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 16px;
+        color: rgba(255, 255, 255, 0.7);
+        pointer-events: none;
+        text-shadow: 0 2px 10px rgba(0,0,0,1);
+        font-family: "CustomFont", serif;
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="ui-container">
+      
+      <div class="header">
+        <div class="logo">秒秒的AI日记</div>
+        <div class="nav-links">
+          <span>THE GARDEN</span>
+          <span>MEMORY</span>
+          <span>MUSIC</span>
+          <span>INFO</span>
+        </div>
+        <div class="header-icons">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </div>
+      </div>
+      
+      <div class="gemini-pill-container">
+        <div class="gemini-pill">
+          <div class="dot"></div>
+          Gemini
+        </div>
+      </div>
+      
+      <div class="settings-icon" id="toggle-settings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+      </div>
+
+      <div class="center-text">窗外是下雪了还是星星？好梦幻啊！</div>
+      
+      <div class="bottom-section">
+        <div class="mic-btn-container">
+          <div class="mic-ring-1"></div>
+          <div class="mic-ring-2"></div>
+          <div class="mic-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="23"></line>
+              <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+          </div>
+        </div>
+        
+        <div class="action-row">
+          <div class="timer">01:13</div>
+          <div class="save-btn">Save Memory &rsaquo;</div>
+          <div class="close-btn">&times;</div>
+        </div>
+        
+        <div class="subtitle-container">
+          <div class="subtitle">让你们的聊天更有那种私密的感觉</div>
+          <div class="upload-another">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+            Upload Another
+            <input type="file" id="image-upload" accept="image/*" />
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+    <script>
+      document.getElementById("toggle-settings").addEventListener("click", () => {
+        const gui = document.querySelector(".dg.ac");
+        if(gui) {
+          gui.classList.toggle("visible");
+        }
+      });
+      
+      document.getElementById("image-upload").addEventListener("change", (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            if(window.initParticles && event.target.result) {
+               window.initParticles(event.target.result);
+            }
+          };
+          reader.readAsDataURL(file);
+        }
+      });
+    </script>
+  </body>
+</html>
