@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>粒子圣诞树</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#000; }
+  canvas { display:block; width:100%; height:100%; }
+  #info { position:absolute; top:10px; left:10px; color:rgba(255,255,255,0.4); font:12px monospace; pointer-events:none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="info"></div>
+<script type="module">
+import * as THREE from 'three';
+
+/* ========== 配置 ========== */
+const BODY_COUNT = 60000;
+const ESCAPE_COUNT = 100000;
+const BG_STARS = 500;
+
+/* ========== 场景 ========== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 1, 1000);
+camera.position.set(0, 10, 180);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+/* ========== 噪声函数（GLSL） ========== */
+const noiseGLSL = `
+vec4 permute(vec4 x){ return mod(((x*34.0)+1.0)*x, 289.0); }
+vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314*r; }
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + 2.0*C.xxx;
+  vec3 x3 = x0 - 1.0 + 3.0*C.xxx;
+  i = mod(i, 289.0);
+  vec4 p = permute(permute(permute(
+    i.z + vec4(0.0, i1.z, i2.z, 1.0))
+    + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+    + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 1.0/7.0;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0*floor(p*ns.z*ns.z);
+  vec4 x_ = floor(j*ns.z);
+  vec4 y_ = floor(j - 7.0*x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0)*2.0 + 1.0;
+  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.5 - vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)), 0.0);
+  m = m*m;
+  return 42.0 * dot(m*m, vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}
+`;
+
+/* ========== 几何生成 ========== */
+function hashf(s) {
+  const n = Math.sin(s * 127.1 + s * 311.7) * 43758.5453123;
+  return n - Math.floor(n);
+}
+function rand(min, max, s) { return min + hashf(s) * (max - min); }
+function inCone(x, y, z, baseR, height, centerY) {
+  const distXZ = Math.sqrt(x*x + z*z);
+  const t = 1 - (y - centerY) / height;
+  return distXZ <= baseR * t && y >= centerY && y <= centerY + height;
+}
+
+function buildTreeData() {
+  const pts = [];
+  const add = (x, y, z, cr, cg, cb, sz, tp) => {
+    const d = Math.sqrt(x*x + z*z);
+    const edgeRatio = d / Math.max(1, Math.abs(y) + 35);
+    let w = 0.1;
+    if (tp === 4 || tp === 1) w = 0.5;
+    else if (edgeRatio > 0.75 && y > -30) w = 0.7;
+    else if (y < -30) w = 0.02;
+    pts.push({ x, y, z, r: cr, g: cg, b: cb, sz, tp, w });
+  };
+  // 3 layers
+  const L = [
+    { y0: -35, h: 50, R: 32, n: 28000, bc: [1, 0.41, 0.71], v: 0.25 },
+    { y0: -5, h: 40, R: 22, n: 22000, bc: [0.54, 0.17, 0.89], v: 0.20 },
+    { y0: 20, h: 30, R: 14, n: 18000, bc: [1, 0, 1], v: 0.18 },
+  ];
+  L.forEach((lay, li) => {
+    for (let i = 0; i < lay.n; i++) {
+      const hh = rand(0, 1, i * 3.17 + li * 97);
+      const ang = rand(0, Math.PI * 2, i * 7.13 + li * 53);
+      const rr = rand(0, 1, i * 5.91 + li * 31);
+      const rad = lay.R * (1 - hh);
+      const x = Math.cos(ang) * rad * Math.sqrt(rr);
+      const z = Math.sin(ang) * rad * Math.sqrt(rr);
+      const y = lay.y0 + hh * lay.h;
+      const vc = (hashf(i * 11.7 + li * 13) - 0.5) * lay.v;
+      add(x, y, z, Math.min(1, Math.max(0, lay.bc[0] + vc)), Math.min(1, Math.max(0, lay.bc[1] + vc)), Math.min(1, Math.max(0, lay.bc[2] + vc)), rand(1.0, 2.8, i * 2.3 + li), 0);
+    }
+  });
+  // ribbon
+  for (let i = 0; i < 8000; i++) {
+    const t = i / 8000;
+    const y = -35 + t * 85;
+    const R = 32 * (1 - t * 0.45);
+    const sp = t * Math.PI * 10 + hashf(i * 9.1) * 0.3;
+    const rr = R * (0.82 + hashf(i * 4.7) * 0.18);
+    add(Math.cos(sp) * rr, y, Math.sin(sp) * rr, 1, 0.55 + hashf(i * 3) * 0.1, 0.75 + hashf(i * 7) * 0.15, rand(1.5, 3.2, i * 1.9), 4);
+  }
+  // ornaments
+  const oc = [];
+  for (let i = 0; i < 18; i++) {
+    const ty = rand(-20, 35, i * 2.1);
+    const tr = (1 - (ty + 35) / 70) * 24 + 4;
+    const ta = rand(0, Math.PI * 2, i * 6.3);
+    oc.push({ x: Math.cos(ta) * tr * rand(0.3, 0.9, i * 1.7), y: ty, z: Math.sin(ta) * tr * rand(0.3, 0.9, i * 1.7), R: rand(2.5, 5, i * 3.3) });
+  }
+  oc.forEach((c, oi) => {
+    for (let j = 0; j < Math.floor(rand(150, 400, oi * 8.1)); j++) {
+      const ph = rand(0, Math.PI, j * 3.1 + oi * 7);
+      const th = rand(0, Math.PI * 2, j * 5.7 + oi * 11);
+      const rad = c.R * Math.cbrt(rand(0, 1, j * 2.3 + oi * 5));
+      add(c.x + rad * Math.sin(ph) * Math.cos(th), c.y + rad * Math.cos(ph), c.z + rad * Math.sin(ph) * Math.sin(th), 0.42 + hashf(j * 1.1 + oi) * 0.15, 0.05 + hashf(j * 2.3 + oi) * 0.08, 0.68 + hashf(j * 4.7 + oi) * 0.15, rand(1.2, 2.8, j * 1.1 + oi), 3);
+    }
+  });
+  // star
+  for (let i = 0; i < 3500; i++) {
+    const arm = Math.floor(rand(0, 6, i * 1.7));
+    let x, y, z;
+    if (arm === 5) {
+      const a = rand(0, Math.PI * 2, i * 3.1);
+      const R = rand(0, 2, i * 5.3);
+      x = Math.cos(a) * R; y = 50 + rand(-2, 2, i * 7.1); z = Math.sin(a) * R;
+    } else {
+      const aa = arm * (Math.PI * 2 / 5) + Math.PI / 2;
+      const t = rand(0, 1, i * 4.3);
+      const al = 8 * (1 - t * 0.5);
+      x = Math.cos(aa) * al * t;
+      z = Math.sin(aa) * al * t;
+      y = 50 + Math.sin(t * Math.PI) * 8 * 0.4 + rand(-1, 1, i * 2.9);
+    }
+    add(x, y, z, 1, 0.92, 0.98, rand(1.5, 3.5, i * 2.7), 1);
+  }
+  // gifts
+  const gifts = [
+    { cx: -22, cy: -38, cz: 8, w: 10, h: 10, d: 10 },
+    { cx: 18, cy: -40, cz: -5, w: 9, h: 8, d: 9 },
+    { cx: 3, cy: -37, cz: 14, w: 8, h: 9, d: 8 },
+  ];
+  gifts.forEach((gift, gi) => {
+    for (let j = 0; j < Math.floor(rand(1800, 2500, gi * 13.7)); j++) {
+      const x = gift.cx + (rand(0, 1, j * 3.1 + gi) - 0.5) * gift.w;
+      const y = gift.cy + (rand(0, 1, j * 5.3 + gi) - 0.5) * gift.h;
+      const z = gift.cz + (rand(0, 1, j * 7.7 + gi) - 0.5) * gift.d;
+      const ribbon = Math.abs(x - gift.cx) < 1.2 || Math.abs(z - gift.cz) < 1.2;
+      if (ribbon) add(x, y, z, 0.95, 0.95, 0.98, rand(1.5, 2.8, j * 2.1 + gi), 2);
+      else if (hashf(j * 3.1 + gi * 7) > 0.5) add(x, y, z, 0.54 + hashf(j * 1.1) * 0.1, 0.17, 0.89, rand(1.0, 2.4, j * 1.9 + gi), 2);
+      else add(x, y, z, 0.85 + hashf(j * 2.3) * 0.1, 0.85 + hashf(j * 4.7) * 0.1, 0.9, rand(1.0, 2.4, j * 1.9 + gi), 2);
+    }
+  });
+  return pts;
+}
+
+const allPts = buildTreeData();
+
+// sample body particles (60k)
+const bodyPos = new Float32Array(BODY_COUNT * 3);
+const bodyCol = new Float32Array(BODY_COUNT * 3);
+const bodySz = new Float32Array(BODY_COUNT);
+const bodyTp = new Float32Array(BODY_COUNT);
+for (let i = 0; i < BODY_COUNT; i++) {
+  const idx = Math.floor(hashf(i * 7.3 + 111) * allPts.length);
+  const p = allPts[idx];
+  bodyPos[i * 3] = p.x; bodyPos[i * 3 + 1] = p.y; bodyPos[i * 3 + 2] = p.z;
+  bodyCol[i * 3] = p.r; bodyCol[i * 3 + 1] = p.g; bodyCol[i * 3 + 2] = p.b;
+  bodySz[i] = p.sz; bodyTp[i] = p.tp;
+}
+
+// weighted spawn pool
+const wSum = allPts.reduce((s, p) => s + p.w, 0);
+function pickSpawn(s) {
+  let t = hashf(s) * wSum;
+  for (const p of allPts) { t -= p.w; if (t <= 0) return p; }
+  return allPts[allPts.length - 1];
+}
+
+// escape particles (100k)
+const escBirth = new Float32Array(ESCAPE_COUNT * 3);
+const escVel = new Float32Array(ESCAPE_COUNT * 3);
+const escCol = new Float32Array(ESCAPE_COUNT * 3);
+const escSz = new Float32Array(ESCAPE_COUNT);
+const escType = new Float32Array(ESCAPE_COUNT);
+const escLife = new Float32Array(ESCAPE_COUNT);
+const escMaxL = new Float32Array(ESCAPE_COUNT);
+const escSeed = new Float32Array(ESCAPE_COUNT);
+const escZOff = new Float32Array(ESCAPE_COUNT);
+function spawnEsc(i) {
+  const sp = pickSpawn(i * 3.7 + 777);
+  escBirth[i * 3] = sp.x; escBirth[i * 3 + 1] = sp.y; escBirth[i * 3 + 2] = sp.z;
+  escCol[i * 3] = sp.r; escCol[i * 3 + 1] = sp.g; escCol[i * 3 + 2] = sp.b;
+  const roll = hashf(i * 5.1 + 333);
+  let tp, sz, spdMul;
+  if (roll < 0.1) { tp = 0; sz = rand(3, 6, i * 2.1); spdMul = rand(0.3, 0.8, i * 4.3); }
+  else if (roll < 0.4) { tp = 1; sz = rand(1.5, 3, i * 2.7); spdMul = rand(1.0, 2.0, i * 5.1); }
+  else { tp = 2; sz = rand(0.5, 1.5, i * 3.3); spdMul = rand(2.0, 4.0, i * 6.7); }
+  escType[i] = tp; escSz[i] = sz;
+  const droll = hashf(i * 7.9 + 555);
+  let vx, vy, vz;
+  if (droll < 0.6) { vx = rand(-0.5, 0.5, i * 1.1); vy = rand(1.0, 2.5, i * 2.3); vz = rand(-0.5, 0.5, i * 3.5); }
+  else if (droll < 0.9) { vx = rand(-2.0, 2.0, i * 4.1); vy = rand(0.2, 1.0, i * 5.3); vz = rand(-2.0, 2.0, i * 6.5); }
+  else { vx = rand(-0.3, 0.3, i * 7.1); vy = rand(-1.0, -0.2, i * 8.3); vz = rand(-0.3, 0.3, i * 9.5); }
+  const vlen = Math.sqrt(vx * vx + vy * vy + vz * vz) + 0.001;
+  escVel[i * 3] = vx / vlen * spdMul; escVel[i * 3 + 1] = vy / vlen * spdMul; escVel[i * 3 + 2] = vz / vlen * spdMul;
+  escMaxL[i] = rand(4, 10, i * 11.1);
+  escLife[i] = rand(0, escMaxL[i], i * 13.7);
+  escSeed[i] = hashf(i * 17.3 + 999);
+  escZOff[i] = (hashf(i * 19.1) - 0.5) * 15;
+}
+for (let i = 0; i < ESCAPE_COUNT; i++) spawnEsc(i);
+
+// background stars
+const spos = [], scol = [], sasz = [], saph = [];
+for (let i = 0; i < BG_STARS; i++) {
+  const th = rand(0, Math.PI * 2, i * 3.1);
+  const ph = rand(0, Math.PI, i * 5.7);
+  const R = 300 + rand(0, 200, i * 7.3);
+  spos.push(R * Math.sin(ph) * Math.cos(th), R * Math.cos(ph), R * Math.sin(ph) * Math.sin(th));
+  const b = 0.5 + hashf(i * 11.3) * 0.5;
+  scol.push(b, b, b + 0.05);
+  sasz.push(0.5 + hashf(i * 2.7) * 1.2);
+  saph.push(rand(0, Math.PI * 2, i * 9.1));
+}
+
+/* ========== 着色器 ========== */
+const bodyVertexShader = `
+  uniform float uTime;
+  ${noiseGLSL}
+  attribute float aTp;
+  varying vec3 vC;
+  varying float vA;
+  void main() {
+    vec3 pos = position;
+    float breathe = snoise(vec3(pos.x * 0.08, pos.y * 0.08, uTime * 0.6)) * 0.8;
+    pos += normalize(pos + vec3(0.001)) * breathe;
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    gl_Position = projectionMatrix * mv;
+    float bs = aTp < 1.5 ? 3.0 : (aTp < 2.5 ? 2.0 : (aTp < 3.5 ? 2.5 : (aTp < 4.5 ? 2.8 : 3.0)));
+    float ps = bs * (snoise(vec3(pos.xy, 0.0)) * 0.4 + 0.8) * (200.0 / -mv.z);
+    gl_PointSize = max(ps, 0.5);
+    vC = color;
+    vA = 0.88;
+    if (aTp > 3.5 && aTp < 4.5) {
+      float tw = sin(uTime * 3.0 + pos.x * 10.0) * 0.5 + 0.5;
+      vA *= 0.7 + tw * 0.6;
+    }
+  }
+`;
+
+const escapeVertexShader = `
+  uniform float uTime;
+  ${noiseGLSL}
+  attribute vec3 aBirth;
+  attribute vec3 aVel;
+  attribute float aLife;
+  attribute float aMaxL;
+  attribute float aSz;
+  attribute float aTp;
+  attribute float aSeed;
+  attribute float aZOff;
+  varying vec3 vC;
+  varying float vA;
+  varying float vTp;
+  void main() {
+    float age = aLife / aMaxL;
+    float t = age;
+    vec3 pos = aBirth;
+    pos += aVel * t * aMaxL * 12.0;
+    vec3 n1 = vec3(
+      snoise(vec3(aBirth.xy * 0.003, uTime * 0.0003 + aSeed)),
+      snoise(vec3(aBirth.yz * 0.003, uTime * 0.0003 + aSeed + 37.0)),
+      snoise(vec3(aBirth.xz * 0.003, uTime * 0.0003 + aSeed + 73.0))
+    );
+    vec3 n2 = vec3(
+      snoise(vec3(aBirth.xy * 0.005, uTime * 0.0002 + aSeed + 11.0)),
+      snoise(vec3(aBirth.yz * 0.005, uTime * 0.0002 + aSeed + 53.0)),
+      snoise(vec3(aBirth.xz * 0.005, uTime * 0.0002 + aSeed + 97.0))
+    );
+    pos += (n1 * 3.0 + n2 * 1.5) * t * aMaxL;
+    pos.z += aZOff * t;
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    gl_Position = projectionMatrix * mv;
+    float shrink = aTp < 0.5 ? 1.0 - t * 0.2 : (aTp < 1.5 ? 1.0 - t * 0.35 : 1.0 - t * 0.5);
+    gl_PointSize = max(aSz * shrink * (200.0 / -mv.z), 0.3);
+    vC = mix(color, vec3(1.0, 0.98, 0.94), t * 0.7);
+    if (aTp < 0.5) vC += vec3(0.15);
+    vA = t < 0.6 ? 0.92 : smoothstep(1.0, 0.6, t) * 0.92;
+    vTp = aTp;
+  }
+`;
+
+const bodyFragmentShader = `
+  varying vec3 vC;
+  varying float vA;
+  void main() {
+    float d = distance(gl_PointCoord, vec2(0.5));
+    if (d > 0.5) discard;
+    float c = smoothstep(0.5, 0.0, d);
+    gl_FragColor = vec4(vC, c * vA);
+  }
+`;
+
+const escapeFragmentShader = `
+  varying vec3 vC;
+  varying float vA;
+  varying float vTp;
+  void main() {
+    float d = distance(gl_PointCoord, vec2(0.5));
+    if (d > 0.5) discard;
+    float c = smoothstep(0.5, 0.0, d);
+    vec3 col = vC;
+    float alpha = vA;
+    if (vTp < 0.5) {
+      col += vec3(c * 0.4);
+      alpha = smoothstep(0.5, 0.1, d) * vA * 1.3;
+    } else if (vTp < 1.5) {
+      col += vec3(c * 0.15);
+    }
+    alpha *= smoothstep(0.5, 0.0, d);
+    gl_FragColor = vec4(col, alpha);
+  }
+`;
+
+const starVertexShader = `
+  uniform float uTime;
+  attribute float aPh;
+  attribute float aSz;
+  varying float vA;
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+    gl_PointSize = aSz * (200.0 / -mv.z);
+    vA = 0.3 + (sin(uTime * 2.0 + aPh) * 0.5 + 0.5) * 0.5;
+  }
+`;
+
+const starFragmentShader = `
+  varying float vA;
+  void main() {
+    float d = distance(gl_PointCoord, vec2(0.5));
+    if (d > 0.5) discard;
+    gl_FragColor = vec4(vec3(1.0), smoothstep(0.5, 0.15, d) * vA);
+  }
+`;
+
+/* ========== 创建粒子系统 ========== */
+// body mesh (fixed tree shape)
+const bGeo = new THREE.BufferGeometry();
+bGeo.setAttribute('position', new THREE.BufferAttribute(bodyPos, 3));
+bGeo.setAttribute('color', new THREE.BufferAttribute(bodyCol, 3));
+bGeo.setAttribute('aTp', new THREE.BufferAttribute(bodyTp, 1));
+const bMat = new THREE.ShaderMaterial({
+  vertexShader: bodyVertexShader,
+  fragmentShader: bodyFragmentShader,
+  uniforms: { uTime: { value: 0 } },
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+const bodyMesh = new THREE.Points(bGeo, bMat);
+scene.add(bodyMesh);
+
+// escape mesh (independent cycle)
+const eGeo = new THREE.BufferGeometry();
+eGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(escBirth), 3));
+eGeo.setAttribute('color', new THREE.BufferAttribute(escCol, 3));
+eGeo.setAttribute('aBirth', new THREE.BufferAttribute(escBirth, 3));
+eGeo.setAttribute('aVel', new THREE.BufferAttribute(escVel, 3));
+eGeo.setAttribute('aLife', new THREE.BufferAttribute(escLife, 1));
+eGeo.setAttribute('aMaxL', new THREE.BufferAttribute(escMaxL, 1));
+eGeo.setAttribute('aSz', new THREE.BufferAttribute(escSz, 1));
+eGeo.setAttribute('aTp', new THREE.BufferAttribute(escType, 1));
+eGeo.setAttribute('aSeed', new THREE.BufferAttribute(escSeed, 1));
+eGeo.setAttribute('aZOff', new THREE.BufferAttribute(escZOff, 1));
+const eMat = new THREE.ShaderMaterial({
+  vertexShader: escapeVertexShader,
+  fragmentShader: escapeFragmentShader,
+  uniforms: { uTime: { value: 0 } },
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+const escMesh = new THREE.Points(eGeo, eMat);
+scene.add(escMesh);
+
+// star mesh
+const starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(spos), 3));
+starGeo.setAttribute('aPh', new THREE.BufferAttribute(new Float32Array(saph), 1));
+starGeo.setAttribute('aSz', new THREE.BufferAttribute(new Float32Array(sasz), 1));
+const starMat = new THREE.ShaderMaterial({
+  vertexShader: starVertexShader,
+  fragmentShader: starFragmentShader,
+  uniforms: { uTime: { value: 0 } },
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+const starMesh = new THREE.Points(starGeo, starMat);
+scene.add(starMesh);
+
+/* ========== 动画与交互 ========== */
+const clock = new THREE.Clock();
+let hoverBoost = 0;
+let burst = 0;
+
+function updateEscape(dt) {
+  let active = 0;
+  const speedMul = 1 + hoverBoost * 2;
+  for (let i = 0; i < ESCAPE_COUNT; i++) {
+    escLife[i] -= dt * speedMul;
+    if (escLife[i] <= 0) {
+      spawnEsc(i);
+      if (burst > 0.01) {
+        escVel[i * 3] *= (1 + burst * 3);
+        escVel[i * 3 + 1] *= (1 + burst * 3);
+        escVel[i * 3 + 2] *= (1 + burst * 3);
+      }
+    } else {
+      active++;
+    }
+  }
+  eGeo.attributes.aLife.needsUpdate = true;
+  if (burst > 0.01) eGeo.attributes.aVel.needsUpdate = true;
+  burst *= 0.92;
+  if (burst < 0.001) burst = 0;
+  return active;
+}
+
+/* ========== 交互事件 ========== */
+window.addEventListener('mousemove', (e) => {
+  const x = (e.clientX / innerWidth) * 2 - 1;
+  const y = -(e.clientY / innerHeight) * 2 + 1;
+  const inTree = Math.abs(x) < 0.25 && y > -0.4 && y < 0.5;
+  hoverBoost += ((inTree ? 1 : 0) - hoverBoost) * 0.1;
+});
+window.addEventListener('mousedown', () => {
+  burst = 1.0;
+  const n = Math.min(5000, ESCAPE_COUNT);
+  for (let k = 0; k < n; k++) {
+    const i = Math.floor(Math.random() * ESCAPE_COUNT);
+    spawnEsc(i);
+    escVel[i * 3] *= 3;
+    escVel[i * 3 + 1] *= 3;
+    escVel[i * 3 + 2] *= 3;
+  }
+  eGeo.attributes.aLife.needsUpdate = true;
+  eGeo.attributes.aVel.needsUpdate = true;
+});
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ========== 动画循环 ========== */
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const time = clock.getElapsedTime();
+
+  bMat.uniforms.uTime.value = time;
+  eMat.uniforms.uTime.value = time;
+  starMat.uniforms.uTime.value = time;
+
+  bodyMesh.rotation.y = Math.sin(time * 0.08) * 0.06;
+  escMesh.rotation.y = bodyMesh.rotation.y;
+
+  const active = updateEscape(dt);
+
+  renderer.render(scene, camera);
+
+  const info = document.getElementById('info');
+  if (info && Math.floor(time * 10) % 10 === 0) {
+    info.textContent = `body: ${BODY_COUNT} | escape: ${ESCAPE_COUNT} | active: ${active}`;
+  }
+}
+
+animate();
+</script>
+</body>
+</html>

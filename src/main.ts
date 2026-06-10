@@ -4,26 +4,26 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 // --- Configuration & State ---
 const config = {
-  dispersion: 0.85,
-  particleSize: 1.08,
-  contrast: 1.35,
-  flowSpeed: 0.45,
-  flowAmplitude: 0.45,
-  depthStrength: 6.0,
+  dispersion: 0.42,
+  particleSize: 0.96,
+  contrast: 1.18,
+  flowSpeed: 0.26,
+  flowAmplitude: 0.24,
+  depthStrength: 4.6,
   mouseRadius: 6.0,
   sphereRadius: 6.0,
-  sphereStrength: 0.82,
-  sphereMass: 0.62,
-  spatialDepth: 8.0,
-  sphereSurfaceBend: 52.0,
-  escapeSpeed: 0.72,
-  escapeMotion: 1.0,
-  escapeBrightness: 1.7,
-  escapeOpacity: 1.8,
-  colorShiftSpeed: 0.12,
+  sphereStrength: 0.58,
+  sphereMass: 0.52,
+  spatialDepth: 7.2,
+  sphereSurfaceBend: 38.0,
+  escapeSpeed: 0.34,
+  escapeMotion: 0.74,
+  escapeBrightness: 1.34,
+  escapeOpacity: 1.22,
+  colorShiftSpeed: 0.0,
   audioDance: false,
   danceStrength: 1.0,
-  depthWave: 0.35
+  depthWave: 0.12
 };
 
 let width = window.innerWidth;
@@ -92,11 +92,28 @@ let userInspecting = false;
 let particlesGeometry: THREE.BufferGeometry;
 let particlesMaterial: THREE.ShaderMaterial;
 let particlesMesh: THREE.Points;
+let particleOcclusionGeometry: THREE.BufferGeometry;
+let particleOcclusionMaterial: THREE.ShaderMaterial;
+let particleOcclusionMesh: THREE.Points;
 let haloGeometry: THREE.BufferGeometry;
 let haloMaterial: THREE.ShaderMaterial;
 let haloMesh: THREE.Points;
 let interactionSphere: THREE.Mesh<THREE.SphereGeometry, THREE.ShaderMaterial>;
 let currentImageSrc = '';
+
+// --- Escape Particle System ---
+const ESCAPE_COUNT = 100000;
+let escBirth: Float32Array = new Float32Array(0);
+let escCol: Float32Array = new Float32Array(0);
+let escVel: Float32Array = new Float32Array(0);
+let escPhase: Float32Array = new Float32Array(0);
+let escMaxL: Float32Array = new Float32Array(0);
+let escSz: Float32Array = new Float32Array(0);
+let escType: Float32Array = new Float32Array(0);
+let escSeed: Float32Array = new Float32Array(0);
+let escZOff: Float32Array = new Float32Array(0);
+let spawnPool: { x:number; y:number; z:number; r:number; g:number; b:number; weight:number }[] = [];
+let spawnTotalWeight = 0;
 
 // Shaders
 const vertexShader = `
@@ -270,10 +287,8 @@ const fragmentShader = `
   }
 
   void main() {
-    vec2 squareCoord = abs(gl_PointCoord - vec2(0.5));
-    float squareMask = 1.0 - smoothstep(0.44, 0.5, max(squareCoord.x, squareCoord.y));
-    if (squareMask <= 0.01) discard;
     float dist = distance(gl_PointCoord, vec2(0.5));
+    if (dist > 0.5) discard;
     
     vec3 color = vColor;
     
@@ -288,11 +303,19 @@ const fragmentShader = `
        color = hsv2rgb(hsv);
     }
     
-    float alpha = squareMask * vAlpha * mix(0.86, 1.12, vScatter);
-    float core = smoothstep(0.34, 0.0, dist);
-    color += core * mix(vec3(0.06, 0.12, 0.18), vec3(0.24), vScatter);
+    float alpha = exp(-dist * dist * 6.5) * vAlpha * mix(0.84, 1.18, vScatter);
+    float core = pow(max(1.0 - dist * 1.85, 0.0), 2.2);
+    color += core * mix(vec3(0.04, 0.08, 0.14), vec3(0.22), vScatter);
     
     gl_FragColor = vec4(color, alpha);
+  }
+`;
+
+const particleOcclusionFragmentShader = `
+  void main() {
+    float dist = distance(gl_PointCoord, vec2(0.5));
+    if (dist > 0.5) discard;
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
   }
 `;
 
@@ -301,26 +324,29 @@ const haloVertexShader = `
   uniform float uParticleSize;
   uniform float uFlowSpeed;
   uniform float uFlowAmplitude;
+  uniform float uEscapeSpeed;
+  uniform float uEscapeMotion;
+  uniform float uEscapeBrightness;
+  uniform float uEscapeOpacity;
   uniform vec3 uSphereCenter;
   uniform vec3 uSphereVelocity;
   uniform float uSphereRadius;
   uniform float uSphereStrength;
   uniform float uSphereMass;
-  uniform float uEscapeSpeed;
-  uniform float uEscapeMotion;
-  uniform float uEscapeBrightness;
-  uniform float uEscapeOpacity;
 
   attribute vec3 color;
-  attribute float size;
-  attribute float alpha;
-  attribute vec3 escapeDirection;
-  attribute float escapeStrength;
-  attribute float escapePhase;
+  attribute vec3 aBirth;
+  attribute vec3 aVel;
+  attribute float aPhase;
+  attribute float aMaxL;
+  attribute float aSz;
+  attribute float aTp;
+  attribute float aSeed;
+  attribute float aZOff;
 
   varying vec3 vColor;
   varying float vAlpha;
-  varying float vEscapeMix;
+  varying float vScatter;
 
   vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
   vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
@@ -371,65 +397,105 @@ const haloVertexShader = `
   }
 
   void main() {
-    vColor = color;
-    vAlpha = alpha;
-    vEscapeMix = clamp(escapeStrength / 58.0, 0.0, 1.0);
+    float life = max(aMaxL, 0.001);
+    float age = mod(uTime * uEscapeSpeed * 0.58 + aPhase * life, life);
+    float progress = age / life;
+    float eased = progress * progress * (3.0 - 2.0 * progress);
+    float t = uTime * 0.18 + aSeed * 0.37;
 
-    vec3 pos = position;
-    vec2 drift = vec2(
-      snoise(vec3(pos.xy * 0.022, uTime * uFlowSpeed * 0.25)),
-      snoise(vec3(pos.yx * 0.022, uTime * uFlowSpeed * 0.25 + 19.0))
-    );
-    pos.xy += drift * uFlowAmplitude * 2.8;
-    pos.z += snoise(vec3(pos.xy * 0.015, uTime * 0.2)) * 1.4;
+    vec2 radial2 = normalize(aBirth.xy + vec2(0.001));
+    vec2 orbit2 = vec2(-radial2.y, radial2.x);
+    float burstNoise = snoise(vec3(aBirth.x * 0.035, aSeed * 0.071, 2.0));
+    float heightVariance = mix(0.45, 1.32, fract(sin(aSeed * 18.731) * 43758.5453));
+    float sideBias = smoothstep(8.0, 54.0, abs(aBirth.x));
+    vec3 pos = aBirth + aVel * age * uEscapeMotion * 0.24;
 
-    float escapeCycle = fract(escapePhase + uTime * uEscapeSpeed * (0.16 + escapeStrength * 0.28));
-    float escapeEase = smoothstep(0.0, 0.28, escapeCycle) * (1.0 - smoothstep(0.72, 1.0, escapeCycle));
-    float escapeTravel = escapeCycle * escapeStrength * uEscapeMotion;
-    vec3 escapeDir = normalize(escapeDirection + vec3(0.001, 0.001, 0.0));
-    vec2 escapeFlutter = vec2(
-      snoise(vec3(position.xy * 0.035, uTime * 0.55 + escapePhase * 17.0)),
-      snoise(vec3(position.yx * 0.035, uTime * 0.55 + escapePhase * 31.0))
-    );
-    pos += escapeDir * escapeTravel * escapeEase;
-    pos.xy += escapeFlutter * escapeStrength * 0.11 * escapeEase * uEscapeMotion;
-    vColor = mix(vColor, vec3(1.0, 0.96, 0.88) * uEscapeBrightness, vEscapeMix * (0.62 + escapeEase * 0.28));
-    vAlpha *= mix(1.0, (0.64 + escapeEase * 0.92) * uEscapeOpacity, vEscapeMix);
+    // Gravity: accelerate downwards quadratically
+    float gravityFactor = eased * eased * (9.0 + aTp * 2.4) * heightVariance * uEscapeMotion;
+    pos.y += gravityFactor;
+    pos.x += sign(aBirth.x) * sideBias * eased * (3.8 + burstNoise * 3.2) * uEscapeMotion;
+    pos.y += max(burstNoise, -0.35) * eased * (3.4 + sideBias * 4.2) * uEscapeMotion;
+    pos.xy += radial2 * eased * (0.45 + aTp * 0.22) * uEscapeMotion;
+    pos.xy += orbit2 * sin(progress * (4.2 + heightVariance * 2.0) + aSeed) * (0.8 + aTp * 0.34 + sideBias * 1.25) * eased * uEscapeMotion;
 
+    // Wave shimmer/sway as they fall (organic sway)
+    float shimmerSpeed = 1.2 + aSeed * 0.012;
+    float wave = sin(uTime * shimmerSpeed + aSeed * 6.2831);
+    pos.x += wave * progress * (1.6 + aTp * 0.55 + sideBias * 3.6) * uEscapeMotion;
+    pos.z += cos(uTime * 0.56 + aSeed * 4.7) * progress * 1.45 * uEscapeMotion + aZOff * eased * 0.14;
+
+    // Large-scale noise flow with vertical correlation for curtain/filament look
+    // By scaling y down, we make the noise vary slowly along y, creating vertical drapery/stripes of falling particles.
+    float nf1 = snoise(vec3(aBirth.x * 0.018, aBirth.y * 0.003, t * 0.42));
+    float nf2 = snoise(vec3(aBirth.x * 0.03 + aSeed * 5.0, aBirth.y * 0.004, t * 0.3));
+    float nf3 = snoise(vec3(aBirth.x * 0.01, aBirth.y * 0.001 + 17.0, t * 0.24));
+    
+    vec3 noiseFlow = vec3(
+      nf1 + nf2 * 0.45 + nf3 * 0.22,
+      abs(nf2) * 0.42 + nf3 * 0.06,
+      nf1 * 0.18 - nf3 * 0.08
+    ) * age * (1.25 + sideBias * 1.9 + heightVariance * 0.45) * uEscapeMotion;
+    
+    pos += noiseFlow;
+
+    // Interaction with the compact gravity well sphere
     vec3 toParticle = pos - uSphereCenter;
     float sphereDist = length(toParticle);
     float sphereRadius = max(uSphereRadius, 0.001);
     vec3 sphereNormal = normalize(toParticle + vec3(0.001, 0.001, 0.001));
     vec3 toSphere = -sphereNormal;
-    float gravityRange = sphereRadius * (2.8 + uSphereMass * 0.9);
-    float gravity = 1.0 - smoothstep(sphereRadius * 0.9, gravityRange, sphereDist);
-    float capture = 1.0 - smoothstep(sphereRadius * 0.22, sphereRadius * 1.24, sphereDist);
-    float motion = clamp(length(uSphereVelocity.xy) * 0.045, 0.0, 1.0);
-    vec3 tangent = normalize(vec3(-sphereNormal.y, sphereNormal.x, 0.25));
+    float gravityRange = sphereRadius * (2.15 + uSphereMass * 0.75);
+    float gravityForce = 1.0 - smoothstep(sphereRadius * 0.72, gravityRange, sphereDist);
+    float capture = 1.0 - smoothstep(sphereRadius * 0.2, sphereRadius * 1.12, sphereDist);
+    float motion = clamp(length(uSphereVelocity.xy) * 0.035, 0.0, 1.0);
+    float glassNoise = snoise(vec3(pos.xy * 0.045, uTime * 0.7));
+    vec3 tangent = normalize(vec3(-sphereNormal.y, sphereNormal.x, 0.16 + glassNoise * 0.2));
+    float physicalForce = uSphereStrength * (0.65 + uSphereMass * 0.7);
+    vec3 capturePoint = uSphereCenter + vec3(
+      snoise(vec3(aBirth.xy * 0.12, uTime * 0.55)),
+      snoise(vec3(aBirth.yx * 0.12, uTime * 0.55 + 23.0)),
+      snoise(vec3(aBirth.xy * 0.08, uTime * 0.42 + 47.0))
+    ) * sphereRadius * 0.42;
 
-    pos += toSphere * gravity * uSphereStrength * (7.0 + uSphereMass * 3.2);
-    pos = mix(pos, uSphereCenter + tangent * sphereRadius * 0.32, capture * clamp(0.08 + uSphereMass * 0.08, 0.0, 0.24));
-    pos += tangent * gravity * (1.8 + motion * 3.5);
-    pos.xy += normalize(uSphereVelocity.xy + vec2(0.001)) * gravity * motion * 4.0;
+    pos += toSphere * gravityForce * physicalForce * 5.0;
+    pos = mix(pos, capturePoint, capture * clamp(0.04 + uSphereMass * 0.055, 0.0, 0.14));
+    pos += tangent * gravityForce * 0.9 * (0.25 + motion) * uSphereStrength;
+    pos.xy += normalize(uSphereVelocity.xy + vec2(0.001)) * gravityForce * motion * 1.7 * uSphereMass;
 
-    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-    gl_Position = projectionMatrix * mvPosition;
-    gl_PointSize = clamp(uParticleSize * size * (300.0 / -mvPosition.z), 0.28, 2.1);
+    vec3 col = color;
+
+    // opacity curve: >0.92 for first 55%, then fade
+    float op = 1.0 - smoothstep(0.72 + heightVariance * 0.08, 1.0, progress);
+    // early birth ramp
+    op *= smoothstep(0.0, 0.08, progress) * uEscapeOpacity;
+
+    // size attenuation with depth
+    float farFade = clamp(1.0 - (pos.z + aZOff) / 90.0, 0.34, 1.0);
+    float baseSize = aSz * farFade * (1.0 - progress * 0.26) * (0.82 + sideBias * 0.28 + heightVariance * 0.16);
+
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    gl_Position = projectionMatrix * mv;
+    gl_PointSize = clamp(uParticleSize * baseSize * (300.0 / -mv.z), 0.25, 6.0);
+
+    vColor = col;
+    vAlpha = op;
+    vScatter = clamp(0.08 + progress * 0.12 + sideBias * 0.08 + (3.0 - min(aTp, 3.0)) * 0.04, 0.08, 0.34);
   }
 `;
 
 const haloFragmentShader = `
   varying vec3 vColor;
   varying float vAlpha;
-  varying float vEscapeMix;
+  varying float vScatter;
 
   void main() {
     float dist = distance(gl_PointCoord, vec2(0.5));
     if (dist > 0.5) discard;
 
-    float core = smoothstep(0.36, 0.0, dist);
-    float alpha = smoothstep(0.5, 0.05, dist) * vAlpha * mix(1.0, 1.35 + core * 0.45, vEscapeMix);
-    vec3 color = vColor + vec3(core * 0.18 * vEscapeMix);
+    vec3 color = vColor;
+    float alpha = exp(-dist * dist * 6.5) * vAlpha * mix(0.84, 1.18, vScatter);
+    float core = pow(max(1.0 - dist * 1.85, 0.0), 2.2);
+    color += core * mix(vec3(0.04, 0.08, 0.14), vec3(0.22), vScatter);
     gl_FragColor = vec4(color, alpha);
   }
 `;
@@ -505,6 +571,164 @@ function getWhiteBackgroundMask(r: number, g: number, b: number) {
   return smoothstep(0.78, 0.94, whiteness) * (1 - smoothstep(0.045, 0.16, saturation));
 }
 
+function getSubjectMaskAt(data: Uint8ClampedArray, width: number, height: number, x: number, y: number) {
+  const cx = clamp(x, 0, width - 1);
+  const cy = clamp(y, 0, height - 1);
+  const i = (cy * width + cx) * 4;
+  return 1 - getWhiteBackgroundMask(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255);
+}
+
+function getSubjectEdgeStrength(data: Uint8ClampedArray, width: number, height: number, x: number, y: number) {
+  const left = getSubjectMaskAt(data, width, height, x - 2, y);
+  const right = getSubjectMaskAt(data, width, height, x + 2, y);
+  const up = getSubjectMaskAt(data, width, height, x, y - 2);
+  const down = getSubjectMaskAt(data, width, height, x, y + 2);
+  return clamp(Math.abs(right - left) + Math.abs(down - up), 0, 1);
+}
+
+function getTopSubjectEdgeStrength(data: Uint8ClampedArray, width: number, height: number, x: number, y: number) {
+  const up = getSubjectMaskAt(data, width, height, x, y - 2);
+  const center = getSubjectMaskAt(data, width, height, x, y);
+  const down = getSubjectMaskAt(data, width, height, x, y + 2);
+  return clamp(Math.max(center - up, down - up), 0, 1);
+}
+
+function sampleImageColorNormalized(data: Uint8ClampedArray, width: number, height: number, nx: number, ny: number) {
+  const px = clamp(Math.round((nx * 0.5 + 0.5) * (width - 1)), 0, width - 1);
+  const py = clamp(Math.round(((-ny) * 0.5 + 0.5) * (height - 1)), 0, height - 1);
+  const i = (py * width + px) * 4;
+  const r = data[i] / 255;
+  const g = data[i + 1] / 255;
+  const b = data[i + 2] / 255;
+  return {
+    r,
+    g,
+    b,
+    brightness: r * 0.299 + g * 0.587 + b * 0.114
+  };
+}
+
+function buildHaloField(data: Uint8ClampedArray, imgW: number, imgH: number, widthArea: number, heightArea: number, depthArea: number) {
+  const birth = new Float32Array(ESCAPE_COUNT * 3);
+  const col = new Float32Array(ESCAPE_COUNT * 3);
+  const vel = new Float32Array(ESCAPE_COUNT * 3);
+  const phase = new Float32Array(ESCAPE_COUNT);
+  const maxL = new Float32Array(ESCAPE_COUNT);
+  const sz = new Float32Array(ESCAPE_COUNT);
+  const type = new Float32Array(ESCAPE_COUNT);
+  const seed = new Float32Array(ESCAPE_COUNT);
+  const zOff = new Float32Array(ESCAPE_COUNT);
+  let count = 0;
+  let attempts = 0;
+
+  while (count < ESCAPE_COUNT && attempts < ESCAPE_COUNT * 28) {
+    attempts += 1;
+    const nx = (Math.random() * 2 - 1) * 1.18;
+    const ny = (Math.random() * 2 - 1) * 1.08;
+    const angle = Math.atan2(ny - 0.04, nx);
+    const lobe = Math.sin(angle * 3.0 + Math.cos(angle * 2.0) * 0.45) * 0.06;
+    const rimNoise = (hash2(Math.floor((nx + 2.0) * 28), Math.floor((ny + 2.0) * 28), 301) - 0.5) * 0.1;
+    const innerNoise = (hash2(Math.floor((nx + 2.0) * 36), Math.floor((ny + 2.0) * 36), 302) - 0.5) * 0.08;
+    const outer = Math.sqrt(
+      (nx / (1.02 + lobe + rimNoise)) ** 2 +
+      ((ny - 0.04) / (0.94 + lobe * 0.7 + rimNoise * 0.8)) ** 2
+    );
+    const inner = Math.sqrt(
+      (nx / (0.71 + innerNoise * 0.55)) ** 2 +
+      ((ny + 0.01) / (0.63 + innerNoise * 0.45)) ** 2
+    );
+    const windowRim = 1 - smoothstep(1.02, 1.34, inner);
+    const shellBand = (1 - smoothstep(0.9, 1.04, outer)) * smoothstep(1.0, 1.08, inner);
+    const diffuseBand = smoothstep(1.08, 1.52, inner) * (1 - smoothstep(0.78, 1.04, outer));
+    const topBias = smoothstep(-0.12, 0.84, ny);
+    const sideBias = smoothstep(0.1, 0.78, Math.abs(nx));
+    const density = clamp(shellBand * (0.58 + windowRim * 0.96 + topBias * 0.28) + diffuseBand * (0.16 + topBias * 0.18 + sideBias * 0.12), 0, 1);
+    if (density < 0.08 || Math.random() > density) {
+      continue;
+    }
+
+    const voidA = 1 - smoothstep(0.16, 0.34, Math.hypot(nx + 0.78, ny - 0.78));
+    const voidB = 1 - smoothstep(0.2, 0.42, Math.hypot(nx - 0.02, ny - 0.98));
+    const voidC = 1 - smoothstep(0.1, 0.24, Math.hypot(nx - 0.76, ny + 0.55));
+    const voidD = 1 - smoothstep(0.12, 0.28, Math.hypot(nx - 0.02, ny + 0.68));
+    const gapNoise = smoothstep(0.72, 0.92, hash2(Math.floor((nx + 1.7) * 23), Math.floor((ny + 1.7) * 23), 404));
+    const voidMask = clamp(Math.max(voidA * 1.1, Math.max(voidB, Math.max(voidC * 1.35, voidD * 0.5))) + gapNoise * topBias * 0.12, 0, 1);
+    if (Math.random() < voidMask * 0.96) {
+      continue;
+    }
+
+    const vortexDist = Math.hypot(nx - 0.76, ny + 0.55);
+    const vortexWeight = 1 - smoothstep(0.12, 0.34, vortexDist);
+    const voidRim = Math.max(1 - smoothstep(0.04, 0.09, Math.abs(vortexDist - 0.17)), 1 - smoothstep(0.04, 0.12, Math.abs(Math.hypot(nx + 0.78, ny - 0.78) - 0.24)));
+    const spread = 1 + diffuseBand * 0.16 + windowRim * 0.1;
+    const posX = nx * widthArea * spread;
+    const posY = ny * heightArea * spread;
+    const posZ = (1 - outer) * depthArea * 8.0 + windowRim * 10.0 + diffuseBand * 2.6 + (hash2(count, attempts, 501) - 0.5) * depthArea * 0.7 + topBias * 2.5;
+    const sample = sampleImageColorNormalized(data, imgW, imgH, clamp(nx * (0.56 + windowRim * 0.12), -0.95, 0.95), clamp(ny * (0.52 + windowRim * 0.12), -0.95, 0.95));
+    const whiten = clamp(windowRim * 0.48 + topBias * 0.14 + voidRim * 0.38, 0, 0.82);
+    const baseBoost = 0.82 + sample.brightness * 0.34 + diffuseBand * 0.1;
+    const dirLength = Math.max(Math.hypot(posX, posY), 0.001);
+    const tangentX = -posY / dirLength;
+    const tangentY = posX / dirLength;
+    const radialX = posX / dirLength;
+    const radialY = posY / dirLength;
+    const vortexDX = nx - 0.76;
+    const vortexDY = ny + 0.55;
+    const vortexLength = Math.max(Math.hypot(vortexDX, vortexDY), 0.001);
+    const vortexTX = -vortexDY / vortexLength;
+    const vortexTY = vortexDX / vortexLength;
+    const drift = 0.12 + windowRim * 0.34 + diffuseBand * 0.18;
+    const velX = tangentX * drift + radialX * (0.04 + diffuseBand * 0.12) + vortexTX * vortexWeight * 0.55;
+    const velY = tangentY * drift + radialY * (0.02 + topBias * 0.08) + vortexTY * vortexWeight * 0.55;
+    const haloType = vortexWeight > 0.18 || windowRim > 0.56 || voidRim > 0.28 ? 1 : (diffuseBand > 0.22 ? 2 : 3);
+    const index3 = count * 3;
+
+    birth[index3] = posX;
+    birth[index3 + 1] = posY;
+    birth[index3 + 2] = posZ;
+    col[index3] = clamp(sample.r * baseBoost * (1 - whiten) + whiten, 0, 1);
+    col[index3 + 1] = clamp(sample.g * baseBoost * (1 - whiten) + whiten * 0.985, 0, 1);
+    col[index3 + 2] = clamp(sample.b * baseBoost * (1 - whiten) + whiten * 0.96, 0, 1);
+    vel[index3] = velX;
+    vel[index3 + 1] = velY;
+    vel[index3 + 2] = (hash2(count, attempts, 511) - 0.5) * 0.35;
+    phase[count] = Math.random();
+    maxL[count] = 0.32 + windowRim * 0.55 + diffuseBand * 0.24 + vortexWeight * 0.4;
+    sz[count] = 0.42 + Math.random() * 0.55 + windowRim * 0.65 + vortexWeight * 0.5 + (haloType < 1.5 ? 0.2 : 0);
+    type[count] = haloType;
+    seed[count] = Math.random() * 100.0;
+    zOff[count] = (hash2(count, attempts, 544) - 0.5) * 8.0 + vortexWeight * 4.0;
+    count += 1;
+  }
+
+  if (count === 0) {
+    return { birth, col, vel, phase, maxL, sz, type, seed, zOff };
+  }
+
+  for (let i = count; i < ESCAPE_COUNT; i++) {
+    const from = i % count;
+    const from3 = from * 3;
+    const to3 = i * 3;
+    birth[to3] = birth[from3];
+    birth[to3 + 1] = birth[from3 + 1];
+    birth[to3 + 2] = birth[from3 + 2];
+    col[to3] = col[from3];
+    col[to3 + 1] = col[from3 + 1];
+    col[to3 + 2] = col[from3 + 2];
+    vel[to3] = vel[from3];
+    vel[to3 + 1] = vel[from3 + 1];
+    vel[to3 + 2] = vel[from3 + 2];
+    phase[i] = phase[from];
+    maxL[i] = maxL[from];
+    sz[i] = sz[from];
+    type[i] = type[from];
+    seed[i] = seed[from];
+    zOff[i] = zOff[from];
+  }
+
+  return { birth, col, vel, phase, maxL, sz, type, seed, zOff };
+}
+
 function createInteractionSphere() {
   const geometry = new THREE.SphereGeometry(1, 64, 32);
   const material = new THREE.ShaderMaterial({
@@ -527,7 +751,7 @@ function createInteractionSphere() {
   sphere.position.copy(inactiveSphereCenter);
   sphere.scale.setScalar(config.sphereRadius);
   sphere.visible = false;
-  sphere.renderOrder = 3;
+  sphere.renderOrder = 4;
   scene.add(sphere);
   return sphere;
 }
@@ -553,6 +777,85 @@ function updateInteractionUniforms() {
 }
 
 interactionSphere = createInteractionSphere();
+
+// --- Escape Helpers ---
+function sampleSpawn() {
+  if (spawnPool.length === 0) return { x:0, y:0, z:0, r:0.5, g:0.5, b:0.5, weight:1 };
+  const rVal = Math.random() * spawnTotalWeight;
+  let cum = 0;
+  for (const p of spawnPool) {
+    cum += p.weight;
+    if (cum >= rVal) return p;
+  }
+  return spawnPool[spawnPool.length - 1];
+}
+
+function spawnEsc(idx: number) {
+  const sp = sampleSpawn();
+  
+  // Center is at 0,0. Find direction from center.
+  const rad = Math.sqrt(sp.x * sp.x + sp.y * sp.y);
+  const dx = rad > 0.001 ? sp.x / rad : (Math.random() - 0.5);
+  const dy = rad > 0.001 ? sp.y / rad : (Math.random() - 0.5);
+  
+  // Decide particle type: 
+  // tp = 1: Large glowing sparks sliding along contour
+  // tp = 2: Medium particles falling down with wavy noise
+  // tp = 3: Tiny misty dust collapsing straight down
+  let tp: number;
+  let vx: number, vy: number, vz: number;
+  let sz: number;
+  const rt = Math.random();
+  
+  if (rt < 0.15) {
+    tp = 1; // Large sparks
+    sz = 1.6 + Math.random() * 2.2;
+  } else if (rt < 0.5) {
+    tp = 2; // Medium particles
+    sz = 0.85 + Math.random() * 1.05;
+  } else {
+    tp = 3; // Fine dust
+    sz = 0.32 + Math.random() * 0.62;
+  }
+
+  // Base speeds
+  const side = Math.random() < 0.5 ? 1 : -1;
+  const spd = 1.6 + Math.random() * 4.2;
+  
+  // Sliding along contour (tangent) + outward push
+  // If we are high up, we slide more along the contour.
+  // If we are at the bottom, we just drop.
+  const contourFactor = clamp((sp.y + 48) / 112, 0, 1.2); // higher near top
+  
+  vx = dx * (0.18 + Math.random() * 1.05) + side * (-dy) * spd * 0.14 * contourFactor;
+  vy = 1.25 + Math.random() * 2.9 + Math.max(dy, 0) * (0.9 + Math.random() * 1.8) + contourFactor * (0.7 + Math.random() * 1.3);
+  vz = (Math.random() - 0.5) * (0.9 + Math.random() * 2.2);
+
+  // Scaling velocities based on particle type for depth and variety
+  if (tp === 1) {
+    // Large sparks: slower, more graceful, slide further
+    vx *= 0.72;
+    vy *= 0.74;
+  } else if (tp === 3) {
+    // Fine dust: faster collapse, more vertical drop
+    vy += (0.7 + Math.random() * 1.8);
+    vx *= 0.68;
+  }
+
+  const maxL = 8.5 + Math.random() * 8.5; // lifetime in seconds (scaled by speed in shader)
+  const seed = Math.random() * 100.0;
+  const zOff = (Math.random() - 0.5) * 12.0;
+
+  escBirth[idx * 3] = sp.x; escBirth[idx * 3 + 1] = sp.y; escBirth[idx * 3 + 2] = sp.z;
+  escCol[idx * 3] = sp.r; escCol[idx * 3 + 1] = sp.g; escCol[idx * 3 + 2] = sp.b;
+  escVel[idx * 3] = vx; escVel[idx * 3 + 1] = vy; escVel[idx * 3 + 2] = vz;
+  escPhase[idx] = Math.random();
+  escMaxL[idx] = maxL;
+  escSz[idx] = sz;
+  escType[idx] = tp;
+  escSeed[idx] = seed;
+  escZOff[idx] = zOff;
+}
 
 // --- Load Image and Create Particles ---
 function initParticles(imageSrc: string) {
@@ -587,13 +890,9 @@ function initParticles(imageSrc: string) {
     const sizes: number[] = [];
     const scatters: number[] = [];
     const alphas: number[] = [];
-    const haloPositions: number[] = [];
-    const haloColors: number[] = [];
-    const haloSizes: number[] = [];
-    const haloAlphas: number[] = [];
-    const haloEscapeDirections: number[] = [];
-    const haloEscapeStrengths: number[] = [];
-    const haloEscapePhases: number[] = [];
+
+    // spawn pool for escape particles
+    spawnPool = [];
     
     const maxArea = 170;
     const maxImageSide = Math.max(imgW, imgH);
@@ -653,8 +952,14 @@ function initParticles(imageSrc: string) {
         const reveal = subject * (1 - smoothstep(0.94 + organicNoise, 1.08 + organicNoise, radius));
         const borderDust = subject * smoothstep(0.5, 0.98, radius) * (1 - smoothstep(1.14, 1.34, radius));
         const edgeStrength = getEdgeStrength(imgData, imgW, imgH, x, y);
+        const subjectEdge = getSubjectEdgeStrength(imgData, imgW, imgH, x, y);
+        const topSubjectEdge = getTopSubjectEdgeStrength(imgData, imgW, imgH, x, y);
+        const imageFrameEdge = subject * Math.max(
+          smoothstep(0.34, 0.49, Math.abs(nx)),
+          smoothstep(0.34, 0.49, Math.abs(ny))
+        );
         const visibleImage = reveal * smoothstep(0.025, 0.12, subject);
-        const dustChance = Math.max(edgeStrength * 0.72, borderDust * 0.9) * subject;
+        const dustChance = Math.max(subjectEdge * 1.35, Math.max(edgeStrength * 0.46, Math.max(borderDust * 0.9, imageFrameEdge * 0.78))) * subject;
         const density = clamp(0.68 + centerDensity * 0.7 + edgeDensity * 0.3, 0.34, 1);
         const keepChance = centerDensity > 0.42
           ? clamp(0.96 + subject * 0.08, 0, 1)
@@ -697,7 +1002,7 @@ function initParticles(imageSrc: string) {
           }
         }
 
-        const contourDensity = clamp(subject * (edgeStrength * 1.55 + borderDust * 0.42 + edgeDensity * 0.18), 0, 1);
+        const contourDensity = clamp(subject * (subjectEdge * 2.1 + edgeStrength * 0.75 + borderDust * 0.58 + imageFrameEdge * 0.5), 0, 1);
         if (contourDensity > 0.18 && hash2(x, y, 14) < contourDensity * 0.78) {
           const tightJitter = 0.22 + contourDensity * 0.46;
           const contourX = posX + (hash2(x, y, 15) - 0.5) * stepX * tightJitter;
@@ -707,7 +1012,7 @@ function initParticles(imageSrc: string) {
           pushParticle(contourX, contourY, contourZ, r, g, b, brightness, contourScatter, centerDensity, edgeStrength, 20);
         }
 
-        if (edgeStrength > 0.22 && subject > 0.3 && hash2(x, y, 18) < contourDensity * 0.34) {
+        if ((subjectEdge > 0.08 || edgeStrength > 0.22 || imageFrameEdge > 0.45) && subject > 0.3 && hash2(x, y, 18) < contourDensity * 0.34) {
           const microX = posX + (hash2(x, y, 19) - 0.5) * stepX * 0.92;
           const microY = posY + (hash2(x, y, 20) - 0.5) * stepY * 0.92;
           const microZ = posZ + (hash2(x, y, 21) - 0.5) * depthArea * 0.05;
@@ -715,69 +1020,59 @@ function initParticles(imageSrc: string) {
           pushParticle(microX, microY, microZ, r, g, b, brightness, microScatter, centerDensity, edgeStrength, 40);
         }
 
-        const haloChance = clamp(edgeStrength * 0.9 + borderDust * 0.95 + outerFalloff * 0.08, 0, 0.92);
-        if (hash2(x, y, 8) < haloChance && subject > 0.18) {
-          const haloDistance = 0.25 + hash2(x, y, 9) * 1.45;
-          const radialX = nx / (Math.sqrt(nx * nx + ny * ny) + 0.001);
-          const radialY = ny / (Math.sqrt(nx * nx + ny * ny) + 0.001);
-          const haloJitterX = (hash2(x, y, 10) - 0.5) * stepX * (5.5 + haloDistance * 4.0);
-          const haloJitterY = (hash2(x, y, 11) - 0.5) * stepY * (5.5 + haloDistance * 4.0);
-          const haloX = posX + radialX * haloDistance * (7.0 + borderDust * 11.0) + haloJitterX;
-          const haloY = posY - radialY * haloDistance * (7.0 + borderDust * 11.0) + haloJitterY;
-          const glow = clamp(0.86 + brightness * 0.72 + edgeStrength * 0.42, 0.45, 1.65);
-          const haloRadius = clamp(Math.sqrt(haloX * haloX + haloY * haloY) / curvedSurfaceRadius, 0, 0.98);
-          const haloSurfaceZ = (Math.sqrt(1 - haloRadius * haloRadius) - 1) * curvedSurfaceLift + haloRadius * haloRadius * depthArea * 0.08;
-
-          haloPositions.push(haloX, haloY, haloSurfaceZ + imageRelief * 0.45 + (hash2(x, y, 12) - 0.5) * depthArea * 0.16);
-          haloColors.push(
-            clamp(r * glow + 0.42, 0, 1),
-            clamp(g * glow + 0.42, 0, 1),
-            clamp(b * glow + 0.42, 0, 1)
-          );
-          haloSizes.push(0.22 + hash2(x, y, 13) * 0.42 + edgeStrength * 0.32);
-          haloAlphas.push(clamp(0.1 + edgeStrength * 0.28 + borderDust * 0.24, 0.05, 0.5));
-          haloEscapeDirections.push(0, 0, 0);
-          haloEscapeStrengths.push(0);
-          haloEscapePhases.push(0);
-        }
-
-        const escapeChance = clamp((borderDust * 0.92 + edgeStrength * 0.34 + outerFalloff * 0.14) * subject, 0, 0.78);
-        if (hash2(x, y, 90) < escapeChance && subject > 0.18) {
-          const edgeLength = Math.sqrt(nx * nx + ny * ny) + 0.001;
-          const radialX = nx / edgeLength;
-          const radialY = ny / edgeLength;
-          const windX = -0.42;
-          const windY = 0.24;
-          const escapeDistance = 14.0 + hash2(x, y, 91) * 42.0 + borderDust * 34.0;
-          const escapeWander = 4.0 + hash2(x, y, 92) * 12.0;
-          const escapeX = posX + radialX * escapeDistance + windX * escapeWander + (hash2(x, y, 93) - 0.5) * stepX * 12.0;
-          const escapeY = posY - radialY * escapeDistance + windY * escapeWander + (hash2(x, y, 94) - 0.5) * stepY * 12.0;
-          const escapeRadius = clamp(Math.sqrt(escapeX * escapeX + escapeY * escapeY) / curvedSurfaceRadius, 0, 0.98);
-          const escapeSurfaceZ = (Math.sqrt(1 - escapeRadius * escapeRadius) - 1) * curvedSurfaceLift + escapeRadius * escapeRadius * depthArea * 0.08;
-          const fade = 1 - smoothstep(34.0, 96.0, escapeDistance);
-          const glow = clamp(1.2 + brightness * 0.95 + edgeStrength * 0.45, 0.75, 2.1);
-
-          haloPositions.push(escapeX, escapeY, escapeSurfaceZ + imageRelief * 0.28 + (hash2(x, y, 95) - 0.5) * depthArea * 0.12);
-          haloColors.push(
-            clamp(r * glow + 0.48, 0, 1),
-            clamp(g * glow + 0.48, 0, 1),
-            clamp(b * glow + 0.48, 0, 1)
-          );
-          haloSizes.push(0.24 + hash2(x, y, 96) * 0.46 + edgeStrength * 0.26);
-          haloAlphas.push(clamp((0.14 + edgeStrength * 0.24 + borderDust * 0.3) * fade, 0.08, 0.62));
-          haloEscapeDirections.push(radialX * 0.88 + windX * 0.28, -radialY * 0.88 + windY * 0.28, (hash2(x, y, 97) - 0.5) * 0.08);
-          haloEscapeStrengths.push(8.0 + hash2(x, y, 98) * 24.0 + borderDust * 18.0);
-          haloEscapePhases.push(hash2(x, y, 99));
+        // collect spawn pool for escape particles (weighted by edgeStrength & brightness)
+        const upperRegion = 1 - smoothstep(0.18, 0.58, y / imgH);
+        const topBand = 1 - smoothstep(0.04, 0.22, y / imgH);
+        const raggedNoise = hash2(Math.floor(x / 17), Math.floor(y / 11), 301);
+        const fineBreakup = hash2(x, y, 302);
+        const leftPlume = Math.exp(-Math.pow((nx + 0.27) / 0.2, 2));
+        const rightPlume = Math.exp(-Math.pow((nx - 0.25) / 0.22, 2));
+        const centerGlow = Math.exp(-Math.pow(nx / 0.28, 2)) * (0.36 + raggedNoise * 0.22);
+        const centerVoid = Math.exp(-Math.pow(nx / 0.16, 2)) * (0.16 + raggedNoise * 0.22);
+        const sidePlumes = clamp(leftPlume * 1.05 + rightPlume * 1.15, 0, 1.6);
+        const overflowArch = upperRegion * clamp(0.18 + raggedNoise * 0.92 + sidePlumes * 0.62 + centerGlow * 0.38 - centerVoid, 0, 1.55);
+        const raggedTop = clamp(topBand * 0.42 + overflowArch, 0, 1.65);
+        const edgeBirth = topSubjectEdge * (1.15 + sidePlumes * 0.9) + raggedTop * (0.28 + subject * 0.86) + edgeStrength * raggedTop * 0.18;
+        const wEdge = edgeBirth * 0.96;
+        const wBright = brightness * 0.18;
+        const wRand = fineBreakup * 0.14;
+        const weight = (wEdge + wBright + wRand) * raggedTop;
+        if (weight > 0.1 && fineBreakup < clamp(0.34 + raggedTop * 0.46 + sidePlumes * 0.14, 0, 0.92) && (topSubjectEdge > 0.025 || raggedTop > 0.36)) {
+          spawnPool.push({ x: posX, y: posY, z: posZ, r, g, b, weight });
         }
       }
     }
-    
-    console.log('Particles created:', positions.length / 3, 'Halo particles:', haloPositions.length / 3);
+
+    console.log('Particles created:', positions.length / 3, 'Spawn pool:', spawnPool.length);
+
+    // build cumulative weights for fast sampling
+    spawnTotalWeight = 0;
+    for (const p of spawnPool) { spawnTotalWeight += p.weight; }
+
+    // init module-level escape arrays
+    escBirth = new Float32Array(ESCAPE_COUNT * 3);
+    escCol = new Float32Array(ESCAPE_COUNT * 3);
+    escVel = new Float32Array(ESCAPE_COUNT * 3);
+    escPhase = new Float32Array(ESCAPE_COUNT);
+    escMaxL = new Float32Array(ESCAPE_COUNT);
+    escSz = new Float32Array(ESCAPE_COUNT);
+    escType = new Float32Array(ESCAPE_COUNT);
+    escSeed = new Float32Array(ESCAPE_COUNT);
+    escZOff = new Float32Array(ESCAPE_COUNT);
+
+    for (let i = 0; i < ESCAPE_COUNT; i++) {
+      spawnEsc(i);
+    }
     
     if (particlesMesh) {
       scene.remove(particlesMesh);
       particlesGeometry.dispose();
       particlesMaterial.dispose();
+    }
+    if (particleOcclusionMesh) {
+      scene.remove(particleOcclusionMesh);
+      particleOcclusionGeometry.dispose();
+      particleOcclusionMaterial.dispose();
     }
     if (haloMesh) {
       scene.remove(haloMesh);
@@ -790,45 +1085,71 @@ function initParticles(imageSrc: string) {
     particlesGeometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
     particlesGeometry.setAttribute('scatter', new THREE.Float32BufferAttribute(scatters, 1));
     particlesGeometry.setAttribute('alpha', new THREE.Float32BufferAttribute(alphas, 1));
-    
+
+    const particleUniforms = {
+      uTime: { value: 0 },
+      uMouse: { value: new THREE.Vector2(-9999, -9999) },
+      uMouseRadius: { value: config.sphereRadius },
+      uSphereCenter: { value: sphereCenter.clone() },
+      uSphereVelocity: { value: sphereVelocity.clone() },
+      uSphereRadius: { value: config.sphereRadius },
+      uSphereStrength: { value: config.sphereStrength },
+      uSphereMass: { value: config.sphereMass },
+      uDispersion: { value: config.dispersion },
+      uParticleSize: { value: config.particleSize },
+      uContrast: { value: config.contrast },
+      uDepthStrength: { value: config.depthStrength },
+      uFlowSpeed: { value: config.flowSpeed },
+      uFlowAmplitude: { value: config.flowAmplitude },
+      uDepthWave: { value: config.depthWave },
+      uDanceStrength: { value: config.audioDance ? config.danceStrength : 0.0 },
+      uColorShiftSpeed: { value: config.colorShiftSpeed }
+    };
+
+    particleOcclusionGeometry = new THREE.BufferGeometry();
+    particleOcclusionGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    particleOcclusionGeometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    particleOcclusionGeometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+    particleOcclusionGeometry.setAttribute('scatter', new THREE.Float32BufferAttribute(scatters, 1));
+    particleOcclusionGeometry.setAttribute('alpha', new THREE.Float32BufferAttribute(alphas, 1));
+
+    particleOcclusionMaterial = new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader: particleOcclusionFragmentShader,
+      uniforms: particleUniforms,
+      depthWrite: true,
+      depthTest: true,
+      blending: THREE.NoBlending
+    });
+    particleOcclusionMaterial.colorWrite = false;
+    particleOcclusionMesh = new THREE.Points(particleOcclusionGeometry, particleOcclusionMaterial);
+    particleOcclusionMesh.renderOrder = 1;
+    scene.add(particleOcclusionMesh);
+
     particlesMaterial = new THREE.ShaderMaterial({
       vertexShader,
       fragmentShader,
-      uniforms: {
-        uTime: { value: 0 },
-        uMouse: { value: new THREE.Vector2(-9999, -9999) },
-        uMouseRadius: { value: config.sphereRadius },
-        uSphereCenter: { value: sphereCenter.clone() },
-        uSphereVelocity: { value: sphereVelocity.clone() },
-        uSphereRadius: { value: config.sphereRadius },
-        uSphereStrength: { value: config.sphereStrength },
-        uSphereMass: { value: config.sphereMass },
-        uDispersion: { value: config.dispersion },
-        uParticleSize: { value: config.particleSize },
-        uContrast: { value: config.contrast },
-        uDepthStrength: { value: config.depthStrength },
-        uFlowSpeed: { value: config.flowSpeed },
-        uFlowAmplitude: { value: config.flowAmplitude },
-        uDepthWave: { value: config.depthWave },
-        uDanceStrength: { value: config.audioDance ? config.danceStrength : 0.0 },
-        uColorShiftSpeed: { value: config.colorShiftSpeed }
-      },
+      uniforms: particleUniforms,
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending
     });
     particlesMesh = new THREE.Points(particlesGeometry, particlesMaterial);
+    particlesMesh.renderOrder = 3;
     scene.add(particlesMesh);
     
     haloGeometry = new THREE.BufferGeometry();
-    haloGeometry.setAttribute('position', new THREE.Float32BufferAttribute(haloPositions, 3));
-    haloGeometry.setAttribute('color', new THREE.Float32BufferAttribute(haloColors, 3));
-    haloGeometry.setAttribute('size', new THREE.Float32BufferAttribute(haloSizes, 1));
-    haloGeometry.setAttribute('alpha', new THREE.Float32BufferAttribute(haloAlphas, 1));
-    haloGeometry.setAttribute('escapeDirection', new THREE.Float32BufferAttribute(haloEscapeDirections, 3));
-    haloGeometry.setAttribute('escapeStrength', new THREE.Float32BufferAttribute(haloEscapeStrengths, 1));
-    haloGeometry.setAttribute('escapePhase', new THREE.Float32BufferAttribute(haloEscapePhases, 1));
-    
+    haloGeometry.setAttribute('position', new THREE.Float32BufferAttribute(escBirth, 3));
+    haloGeometry.setAttribute('color', new THREE.Float32BufferAttribute(escCol, 3));
+    haloGeometry.setAttribute('aBirth', new THREE.Float32BufferAttribute(escBirth, 3));
+    haloGeometry.setAttribute('aVel', new THREE.Float32BufferAttribute(escVel, 3));
+    haloGeometry.setAttribute('aPhase', new THREE.Float32BufferAttribute(escPhase, 1));
+    haloGeometry.setAttribute('aMaxL', new THREE.Float32BufferAttribute(escMaxL, 1));
+    haloGeometry.setAttribute('aSz', new THREE.Float32BufferAttribute(escSz, 1));
+    haloGeometry.setAttribute('aTp', new THREE.Float32BufferAttribute(escType, 1));
+    haloGeometry.setAttribute('aSeed', new THREE.Float32BufferAttribute(escSeed, 1));
+    haloGeometry.setAttribute('aZOff', new THREE.Float32BufferAttribute(escZOff, 1));
+
     haloMaterial = new THREE.ShaderMaterial({
       vertexShader: haloVertexShader,
       fragmentShader: haloFragmentShader,
@@ -837,22 +1158,24 @@ function initParticles(imageSrc: string) {
         uParticleSize: { value: config.particleSize },
         uFlowSpeed: { value: config.flowSpeed },
         uFlowAmplitude: { value: config.flowAmplitude },
+        uEscapeSpeed: { value: config.escapeSpeed },
+        uEscapeMotion: { value: config.escapeMotion },
+        uEscapeBrightness: { value: config.escapeBrightness },
+        uEscapeOpacity: { value: config.escapeOpacity },
         uSphereCenter: { value: sphereCenter.clone() },
         uSphereVelocity: { value: sphereVelocity.clone() },
         uSphereRadius: { value: config.sphereRadius },
         uSphereStrength: { value: config.sphereStrength },
-        uSphereMass: { value: config.sphereMass },
-        uEscapeSpeed: { value: config.escapeSpeed },
-        uEscapeMotion: { value: config.escapeMotion },
-        uEscapeBrightness: { value: config.escapeBrightness },
-        uEscapeOpacity: { value: config.escapeOpacity }
+        uSphereMass: { value: config.sphereMass }
       },
       transparent: true,
       depthWrite: false,
+      depthTest: true,
       blending: THREE.AdditiveBlending
     });
     
     haloMesh = new THREE.Points(haloGeometry, haloMaterial);
+    haloMesh.renderOrder = 2;
     scene.add(haloMesh);
   };
   
@@ -912,24 +1235,24 @@ gui.add(config, 'particleSize', 0.1, 10).name('粒子大小').onChange(v => {
   if (haloMaterial) haloMaterial.uniforms.uParticleSize.value = v;
 });
 gui.add(config, 'contrast', 0, 3).name('对比度').onChange(v => particlesMaterial && (particlesMaterial.uniforms.uContrast.value = v));
-gui.add(config, 'flowSpeed', 0, 5).name('流动速度').onChange(v => {
+gui.add(config, 'flowSpeed', 0, 5).name('主体流速').onChange(v => {
   if (particlesMaterial) particlesMaterial.uniforms.uFlowSpeed.value = v;
   if (haloMaterial) haloMaterial.uniforms.uFlowSpeed.value = v;
 });
-gui.add(config, 'flowAmplitude', 0, 5).name('流动幅度').onChange(v => {
+gui.add(config, 'flowAmplitude', 0, 5).name('主体流幅').onChange(v => {
   if (particlesMaterial) particlesMaterial.uniforms.uFlowAmplitude.value = v;
   if (haloMaterial) haloMaterial.uniforms.uFlowAmplitude.value = v;
 });
-gui.add(config, 'escapeSpeed', 0, 2).name('逃逸速度').onChange(v => {
+gui.add(config, 'escapeSpeed', 0.05, 1.4).name('上部崩塌速度').onChange(v => {
   if (haloMaterial) haloMaterial.uniforms.uEscapeSpeed.value = v;
 });
-gui.add(config, 'escapeMotion', 0, 2.5).name('逃逸幅度').onChange(v => {
+gui.add(config, 'escapeMotion', 0.2, 2.0).name('上部溢出范围').onChange(v => {
   if (haloMaterial) haloMaterial.uniforms.uEscapeMotion.value = v;
 });
-gui.add(config, 'escapeBrightness', 0.5, 3.5).name('逃逸亮度').onChange(v => {
+gui.add(config, 'escapeBrightness', 0.8, 4.0).name('上部溢出亮度').onChange(v => {
   if (haloMaterial) haloMaterial.uniforms.uEscapeBrightness.value = v;
 });
-gui.add(config, 'escapeOpacity', 0.4, 3.0).name('逃逸透明度').onChange(v => {
+gui.add(config, 'escapeOpacity', 0.5, 3.0).name('上部溢出浓度').onChange(v => {
   if (haloMaterial) haloMaterial.uniforms.uEscapeOpacity.value = v;
 });
 gui.add(config, 'depthStrength', 0, 24).name('浮雕深度').onChange(v => particlesMaterial && (particlesMaterial.uniforms.uDepthStrength.value = v));
@@ -957,7 +1280,6 @@ gui.add(config, 'colorShiftSpeed', 0, 2).name('色相流动').onChange(v => part
 gui.add(config, 'audioDance').name('音频律动').onChange(v => particlesMaterial && (particlesMaterial.uniforms.uDanceStrength.value = v ? config.danceStrength : 0.0));
 gui.add(config, 'danceStrength', 0, 5).name('律动强度').onChange(v => particlesMaterial && (particlesMaterial.uniforms.uDanceStrength.value = config.audioDance ? v : 0.0));
 gui.add(config, 'depthWave', 0, 5).name('深度波动').onChange(v => particlesMaterial && (particlesMaterial.uniforms.uDepthWave.value = v));
-
 // --- Animation Loop ---
 const timer = new THREE.Timer();
 timer.connect(document);
